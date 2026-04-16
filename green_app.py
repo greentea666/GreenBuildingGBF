@@ -80,12 +80,28 @@ def get_app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 APP_DIR = get_app_dir()
-CONFIG_PATH = os.path.join(APP_DIR, "config.yaml")
-# Fallback: check parent directory (for when EXE is in dist/ subfolder)
-if not os.path.exists(CONFIG_PATH):
-    _parent = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
-    if os.path.exists(_parent):
-        CONFIG_PATH = _parent
+
+def _find_config():
+    """Find config.yaml: check EXE directory first, then parent directory."""
+    local = os.path.join(APP_DIR, "config.yaml")
+    parent = os.path.join(os.path.dirname(APP_DIR), "config.yaml")
+    # Prefer parent if it has real data (authorization filled in)
+    if os.path.exists(parent):
+        try:
+            with open(parent, "r", encoding="utf-8") as f:
+                import yaml as _y
+                data = _y.safe_load(f) or {}
+            if data.get("office", {}).get("authorization"):
+                return parent
+        except Exception:
+            pass
+    if os.path.exists(local):
+        return local
+    if os.path.exists(parent):
+        return parent
+    return local  # default: will be created here on first save
+
+CONFIG_PATH = _find_config()
 
 DEFAULT_CONFIG = {
     "office": {
@@ -368,6 +384,100 @@ def extract_plants(texts):
     return unique
 
 
+def extract_window_placement(texts):
+    """從平面圖標註判斷窗戶配置：方位、樓層、數量。
+
+    策略：
+    1. 找出所有窗號標籤（W/S/DW），按 Y 座標分群（每群 = 一個視圖）
+    2. 過濾掉門窗表（每種只出現 1 次的群組）
+    3. 若多群分佈在不同 X 區域（不同圖紙），只取主群
+    4. 以 Y 座標由低到高 = 1F, 2F, 3F… 排列
+    5. 統計每層各窗型出現幾次
+    """
+    wno_re = re.compile(r"^(W\d+|S\d+|DW\d+)$")
+
+    # ── Step 1: Collect window labels ──
+    win_labels = []
+    for t in texts:
+        txt = t["text"].strip()
+        if wno_re.match(txt):
+            win_labels.append({"wno": txt, "x": t["x"], "y": t["y"]})
+
+    if not win_labels:
+        return []
+
+    # ── Step 2: Group by Y coordinate (each cluster = one view) ──
+    win_labels.sort(key=lambda w: w["y"])
+    y_clusters = []
+    cur = [win_labels[0]]
+    for w in win_labels[1:]:
+        if w["y"] - cur[-1]["y"] > 2000:
+            y_clusters.append(cur)
+            cur = [w]
+        else:
+            cur.append(w)
+    y_clusters.append(cur)
+
+    # ── Step 3: Filter out 門窗表 (schedule) clusters ──
+    # Schedule clusters have each window type appearing only once
+    plan_clusters = []
+    for cluster in y_clusters:
+        counts = {}
+        for w in cluster:
+            counts[w["wno"]] = counts.get(w["wno"], 0) + 1
+        if max(counts.values()) > 1 and len(cluster) > 5:
+            plan_clusters.append(cluster)
+
+    if not plan_clusters:
+        return []
+
+    # ── Step 4: Group clusters by X region (detect different sheets) ──
+    # Clusters on different sheets have X centers far apart (>50000)
+    def cluster_x_center(cl):
+        return sum(w["x"] for w in cl) / len(cl)
+
+    if len(plan_clusters) > 1:
+        x_centers = [(i, cluster_x_center(cl)) for i, cl in enumerate(plan_clusters)]
+        x_centers.sort(key=lambda p: p[1])
+        # Group by X proximity
+        x_groups = [[x_centers[0]]]
+        for item in x_centers[1:]:
+            if item[1] - x_groups[-1][-1][1] > 50000:
+                x_groups.append([item])
+            else:
+                x_groups[-1].append(item)
+        # Pick the group with the most clusters (main floor plans)
+        best_group = max(x_groups, key=len)
+        keep_indices = {item[0] for item in best_group}
+        plan_clusters = [cl for i, cl in enumerate(plan_clusters) if i in keep_indices]
+
+    if not plan_clusters:
+        return []
+
+    # ── Step 5: Assign floor by Y order (lowest Y = 1F) ──
+    plan_clusters.sort(key=lambda cl: min(w["y"] for w in cl))
+
+    # ── Step 6: Aggregate per-floor window counts ──
+    # Default direction — cannot reliably determine from floor plans alone
+    default_dir = "W"
+    result = []
+    for floor_idx, cluster in enumerate(plan_clusters):
+        floor_num = floor_idx + 1
+        counts = {}
+        for w in cluster:
+            counts[w["wno"]] = counts.get(w["wno"], 0) + 1
+
+        for wno, qty in sorted(counts.items()):
+            result.append({
+                "direction": default_dir,
+                "floor": str(floor_num),
+                "window_no": wno,
+                "quantity": qty,
+            })
+
+    return result
+
+
 # ─────────────────────────────────────────────────────────
 # GBF builder
 # ─────────────────────────────────────────────────────────
@@ -425,7 +535,41 @@ def make_energy_saving():
     }
 
 
-def build_gbf(project_info, window_counts, plants, cfg):
+def make_window_grid_entry(direction, floor, wno, quantity, agi=1.0):
+    """Build one WindowGridData entry for the EnergySaving section."""
+    return {
+        "EnergyConsumingPartition": 0,
+        "Position": direction,
+        "Floor": floor,
+        "HouseholdNo": "1",
+        "RoomNo": "1",
+        "WindowNo": wno,
+        "Quantity": quantity,
+        "Agi": agi,
+        "Angle": 90,
+        "ShadeType": "無遮陽",
+        "ShadeWs": 0, "ShadeHs": 0,
+        "ShadeDepthX1": 0, "ShadeDepthX2": 0,
+        "ShadeDepthY1": 0, "ShadeDepthY2": 0,
+        "ShadeIsVerOneSide": False,
+        "zipImageBytes": None,
+        "ShadeCoverage": 100,
+        "ShadeIsMore1com": False, "ShadeIsLess1com": False,
+        "ShadePerforationA0": 0, "ShadePerforationA1": 0,
+        "LouverNone": True, "LouverUse": False,
+        "LouverIsFix": False, "LouverIsAuto": False, "LouverIsManual": False,
+        "LouverA": 0, "LouverB": 0,
+        "LouverIsOutside": True, "LouverIsInside": False,
+        "LouverIsOpaque": False, "LouverIsGlass": False,
+        "LouverGlassηi": 0, "LouverIsPerforation": False,
+        "LouverPerforationA0": 0, "LouverPerforationA1": 0,
+        "LouverIsNonDouble": False, "LouverIsDouble": False,
+        "LouverDoubleηi": 0, "ManualInputKi": 0,
+        "KbiType": 0, "DataCheck": "",
+    }
+
+
+def build_gbf(project_info, window_counts, plants, cfg, window_placements=None):
     office = cfg.get("office", {})
     person = make_file_person(office)
     win_cfg = cfg.get("window_defaults", {})
@@ -578,6 +722,22 @@ def build_gbf(project_info, window_counts, plants, cfg):
             "CheckedOver2Native": True, "CheckedOneNative": False,
             "Status": 1,
         })
+
+    # Build window placement entries (WindowGridData)
+    if window_placements:
+        wgd = gbf["ApplicationGridData"][0]["EnergySaving"]["WindowGridData"]
+        for wp in window_placements:
+            wno = wp["window_no"]
+            w_base = gbf["DataWindowBaseUser"].get(wno, {})
+            agi = w_base.get("Agsi", 1.0)
+            entry = make_window_grid_entry(
+                direction=wp["direction"],
+                floor=wp["floor"],
+                wno=wno,
+                quantity=wp["quantity"],
+                agi=agi,
+            )
+            wgd.append(entry)
 
     return gbf
 
@@ -1454,6 +1614,7 @@ class GreenBuildingApp(tk.Tk):
             info = extract_project_info(blocks, texts)
             wins = extract_windows(blocks, texts)
             plants = extract_plants(texts)
+            placements = extract_window_placement(texts)
 
             self.after(0, lambda: self._log(""))
             self.after(0, lambda: self._log("=== 掃描結果 ===", "head"))
@@ -1465,6 +1626,15 @@ class GreenBuildingApp(tk.Tk):
             for w, c in sorted(wins.items()):
                 self.after(0, lambda w=w, c=c: self._log(f"    {w}: {c} 個", "info"))
 
+            if placements:
+                self.after(0, lambda: self._log(f"\n  窗戶配置: {len(placements)} 筆（自動偵測）", "good"))
+                for wp in placements:
+                    self.after(0, lambda wp=wp: self._log(
+                        f"    {wp['direction']}向 {wp['floor']}F {wp['window_no']} ×{wp['quantity']}", "info"))
+            else:
+                self.after(0, lambda: self._log(
+                    "\n  窗戶配置: 未偵測到立面圖標註，WindowGridData 將為空", "warn"))
+
             self.after(0, lambda: self._log(f"\n  植栽: {len(plants)} 項", "info"))
             for p in plants:
                 self.after(0, lambda p=p: self._log(
@@ -1474,7 +1644,7 @@ class GreenBuildingApp(tk.Tk):
 
             # Reload config in case user changed settings
             self.cfg = load_config()
-            gbf = build_gbf(info, wins, plants, self.cfg)
+            gbf = build_gbf(info, wins, plants, self.cfg, placements)
 
             name = info.get("address", "green_building")
             # Sanitize filename
