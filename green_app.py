@@ -385,14 +385,18 @@ def extract_plants(texts):
 
 
 def extract_window_placement(texts):
-    """從平面圖標註判斷窗戶配置：方位、樓層、數量。
+    """從平面圖窗戶標籤位置推斷窗戶配置：方位、樓層、數量。
 
     策略：
-    1. 找出所有窗號標籤（W/S/DW），按 Y 座標分群（每群 = 一個視圖）
+    1. 找出所有窗號標籤（W/S/DW），按 Y 座標分群（每群 = 一個平面圖）
     2. 過濾掉門窗表（每種只出現 1 次的群組）
     3. 若多群分佈在不同 X 區域（不同圖紙），只取主群
     4. 以 Y 座標由低到高 = 1F, 2F, 3F… 排列
-    5. 統計每層各窗型出現幾次
+    5. 每個標籤依其相對平面圖邊界框的位置（最靠近哪面邊界）判斷方位：
+       - 最靠近上緣 → N（北）
+       - 最靠近下緣 → S（南）
+       - 最靠近右緣 → E（東）
+       - 最靠近左緣 → W（西）
     """
     wno_re = re.compile(r"^(W\d+|S\d+|DW\d+)$")
 
@@ -419,7 +423,6 @@ def extract_window_placement(texts):
     y_clusters.append(cur)
 
     # ── Step 3: Filter out 門窗表 (schedule) clusters ──
-    # Schedule clusters have each window type appearing only once
     plan_clusters = []
     for cluster in y_clusters:
         counts = {}
@@ -432,21 +435,18 @@ def extract_window_placement(texts):
         return []
 
     # ── Step 4: Group clusters by X region (detect different sheets) ──
-    # Clusters on different sheets have X centers far apart (>50000)
     def cluster_x_center(cl):
         return sum(w["x"] for w in cl) / len(cl)
 
     if len(plan_clusters) > 1:
         x_centers = [(i, cluster_x_center(cl)) for i, cl in enumerate(plan_clusters)]
         x_centers.sort(key=lambda p: p[1])
-        # Group by X proximity
         x_groups = [[x_centers[0]]]
         for item in x_centers[1:]:
             if item[1] - x_groups[-1][-1][1] > 50000:
                 x_groups.append([item])
             else:
                 x_groups[-1].append(item)
-        # Pick the group with the most clusters (main floor plans)
         best_group = max(x_groups, key=len)
         keep_indices = {item[0] for item in best_group}
         plan_clusters = [cl for i, cl in enumerate(plan_clusters) if i in keep_indices]
@@ -457,24 +457,46 @@ def extract_window_placement(texts):
     # ── Step 5: Assign floor by Y order (lowest Y = 1F) ──
     plan_clusters.sort(key=lambda cl: min(w["y"] for w in cl))
 
-    # ── Step 6: Aggregate per-floor window counts ──
-    # Default direction — cannot reliably determine from floor plans alone
-    default_dir = "W"
-    result = []
-    for floor_idx, cluster in enumerate(plan_clusters):
+    # ── Step 6: For each plan, classify each label by nearest edge ──
+    result_counts = {}  # (floor, direction, wno) -> count
+    for floor_idx, plan in enumerate(plan_clusters):
         floor_num = floor_idx + 1
-        counts = {}
-        for w in cluster:
-            counts[w["wno"]] = counts.get(w["wno"], 0) + 1
+        x_min = min(w["x"] for w in plan)
+        x_max = max(w["x"] for w in plan)
+        y_min = min(w["y"] for w in plan)
+        y_max = max(w["y"] for w in plan)
+        x_range = max(x_max - x_min, 1)
+        y_range = max(y_max - y_min, 1)
 
-        for wno, qty in sorted(counts.items()):
-            result.append({
-                "direction": default_dir,
-                "floor": str(floor_num),
-                "window_no": wno,
-                "quantity": qty,
-            })
+        for w in plan:
+            nx = (w["x"] - x_min) / x_range
+            ny = (w["y"] - y_min) / y_range
+            # Distance from each edge (smaller = closer to that wall)
+            d_n = 1 - ny
+            d_s = ny
+            d_e = 1 - nx
+            d_w = nx
+            min_d = min(d_n, d_s, d_e, d_w)
+            if d_n == min_d:
+                direction = "N"
+            elif d_s == min_d:
+                direction = "S"
+            elif d_e == min_d:
+                direction = "E"
+            else:
+                direction = "W"
+            key = (floor_num, direction, w["wno"])
+            result_counts[key] = result_counts.get(key, 0) + 1
 
+    # ── Step 7: Build result list ──
+    result = []
+    for (floor, direction, wno), qty in sorted(result_counts.items()):
+        result.append({
+            "direction": direction,
+            "floor": str(floor),
+            "window_no": wno,
+            "quantity": qty,
+        })
     return result
 
 
