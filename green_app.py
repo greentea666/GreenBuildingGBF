@@ -720,8 +720,12 @@ class GreenBuildingApp(tk.Tk):
         self.dwg_path = None
         self.output_path = None
         self.cfg = load_config()
+        self._has_saved_config = os.path.exists(CONFIG_PATH)
 
         self._build_ui()
+
+        # Auto-save settings on window close
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Enable drag-and-drop (must be after window is fully built)
         if HAS_DND:
@@ -917,6 +921,9 @@ class GreenBuildingApp(tk.Tk):
         self._show_tab("scan")
 
     def _show_tab(self, name):
+        # Auto-save settings when leaving settings page
+        if self._active_tab == "settings" and name != "settings":
+            self._auto_save_settings()
         self._active_tab = name
         for n, page in self._pages.items():
             if n == name:
@@ -1262,6 +1269,14 @@ class GreenBuildingApp(tk.Tk):
                                       fg=C["green"], bg=C["bg"])
         self._save_status.pack(side="left", padx=8)
 
+        # Auto-save hint
+        hint_text = ("💡 設定會在切換分頁或關閉程式時自動儲存"
+                     if not self._has_saved_config
+                     else "✓ 已載入上次儲存的設定（自動記憶）")
+        hint_color = C["overlay"] if not self._has_saved_config else C["green"]
+        tk.Label(scroll_frame, text=hint_text, font=FONT_CAPTION,
+                 fg=hint_color, bg=C["bg"], anchor="w").pack(padx=12, pady=(0, 20))
+
     def _section_label(self, parent, title, subtitle=""):
         frame = tk.Frame(parent, bg=C["bg"])
         frame.pack(fill="x", padx=10, pady=(20, 6))
@@ -1307,6 +1322,41 @@ class GreenBuildingApp(tk.Tk):
         self.cfg = cfg
         self._save_status.configure(text="已儲存!", fg=C["green"])
         self.after(2000, lambda: self._save_status.configure(text=""))
+
+    def _auto_save_settings(self):
+        """Silently save settings (called on tab switch and window close)."""
+        try:
+            if not hasattr(self, "se") or not self.se:
+                return
+            cfg = dict(DEFAULT_CONFIG)
+            for k in cfg:
+                if isinstance(cfg[k], dict):
+                    cfg[k] = dict(cfg[k])
+            for key, entry in self.se.items():
+                section, field = key.split(".", 1)
+                section_map = {
+                    "office": "office", "window": "window_defaults",
+                    "site": "site_defaults", "project": "project_defaults"
+                }
+                cfg_section = section_map.get(section, section)
+                val = entry.get()
+                if field == "is_public":
+                    val = 0 if val == "公有建築" else 1
+                elif field in ("open_ratio", "soil_permeability"):
+                    try:
+                        val = float(val)
+                    except ValueError:
+                        pass
+                cfg[cfg_section][field] = val
+            save_config(cfg)
+            self.cfg = cfg
+        except Exception:
+            pass
+
+    def _on_close(self):
+        """Auto-save settings before closing the window."""
+        self._auto_save_settings()
+        self.destroy()
 
     # ── Scan actions ─────────────────────────────────
 
