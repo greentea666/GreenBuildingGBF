@@ -1,60 +1,71 @@
 # -*- coding: utf-8 -*-
-"""Generate a retro-style app icon for GreenBuildingGBF"""
-from PIL import Image, ImageDraw, ImageFont
-import os
+"""Generate app.ico from the groma_cross SVG design.
+
+SVG geometry (100x100 viewBox):
+- Horizontal bar: rect(18, 46, 64, 8), rx=1
+- Vertical bar:   rect(46, 18, 8, 64), rx=1
+- Center void:    rect(44, 44, 12, 12) [white fill]
+- Center dot:     circle(50, 50, r=2.5)
+
+Foreground color: currentColor → we'll pick a solid dark color.
+"""
+from PIL import Image, ImageDraw
 
 SIZES = [16, 32, 48, 64, 128, 256]
-OUT = os.path.join(os.path.dirname(__file__), "app.ico")
+FG = (30, 35, 45, 255)      # near-black, slight blue tint
+BG = (255, 255, 255, 0)      # transparent
+VOID = (255, 255, 255, 0)    # transparent void (matches bg)
 
 
-def draw_icon(size):
-    """Draw a single icon at given size."""
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
+def render(size):
+    # Render at 4x super-sampling then downscale for crisper edges
+    scale = 4
+    S = size * scale
+    img = Image.new("RGBA", (S, S), BG)
+    draw = ImageDraw.Draw(img)
 
-    # ── Background: warm off-white rounded square ──
-    margin = max(1, size // 16)
-    bg_rect = [margin, margin, size - margin - 1, size - margin - 1]
-    # Rounded rect background
-    r = max(2, size // 8)
-    d.rounded_rectangle(bg_rect, radius=r, fill="#F5F3EE", outline="#1A1A1A",
-                        width=max(1, size // 64))
+    def u(v):
+        """SVG unit (0..100) → pixels at current size."""
+        return v / 100.0 * S
 
-    # ── Amber accent bar at top ──
-    bar_h = max(2, size // 8)
-    bar_rect = [margin + 1, margin + 1, size - margin - 2, margin + bar_h]
-    d.rectangle(bar_rect, fill="#F0A500")
+    def rect(x, y, w, h, fill, radius=0):
+        if radius > 0:
+            draw.rounded_rectangle(
+                [u(x), u(y), u(x + w), u(y + h)],
+                radius=u(radius),
+                fill=fill,
+            )
+        else:
+            draw.rectangle([u(x), u(y), u(x + w), u(y + h)], fill=fill)
 
-    # ── Text: "GBF" ──
-    try:
-        font_size = max(8, size * 38 // 100)
-        font = ImageFont.truetype("consola.ttf", font_size)
-    except Exception:
-        try:
-            font = ImageFont.truetype("C:/Windows/Fonts/consola.ttf", font_size)
-        except Exception:
-            font = ImageFont.load_default()
+    # Horizontal bar
+    rect(18, 46, 64, 8, FG, radius=1)
+    # Vertical bar
+    rect(46, 18, 8, 64, FG, radius=1)
+    # Center void (punch out to transparent)
+    rect(44, 44, 12, 12, VOID)
+    # Center precision dot
+    r = 2.5
+    draw.ellipse(
+        [u(50 - r), u(50 - r), u(50 + r), u(50 + r)],
+        fill=FG,
+    )
 
-    text = "GBF"
-    bbox = d.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    tx = (size - tw) // 2
-    ty = margin + bar_h + (size - margin * 2 - bar_h - th) // 2 - max(1, size // 20)
-    d.text((tx, ty), text, fill="#1A1A1A", font=font)
-
-    # ── Small leaf/green accent at bottom-right ──
-    leaf_size = max(3, size // 6)
-    lx = size - margin - leaf_size - max(2, size // 10)
-    ly = size - margin - leaf_size - max(2, size // 12)
-    d.ellipse([lx, ly, lx + leaf_size, ly + leaf_size], fill="#2D8A4E")
-
-    return img
+    return img.resize((size, size), Image.LANCZOS)
 
 
-# Generate all sizes
-icons = [draw_icon(s) for s in SIZES]
+def build_ico(path):
+    # Render a large master image; Pillow will create each ICO size from it
+    master = render(256)
+    master.save(path, format="ICO", sizes=[(s, s) for s in SIZES])
 
-# Save as .ico with multiple sizes
-icons[0].save(OUT, format="ICO", sizes=[(s, s) for s in SIZES],
-              append_images=icons[1:])
-print(f"Icon saved: {OUT}")
+
+if __name__ == "__main__":
+    import sys
+    out = sys.argv[1] if len(sys.argv) > 1 else r"C:\temp\app.ico"
+    build_ico(out)
+    # Also save a big PNG for preview
+    preview = render(512)
+    preview.save(out.replace(".ico", "_preview.png"))
+    import os
+    print(f"Wrote {out} ({os.path.getsize(out)} bytes)")
